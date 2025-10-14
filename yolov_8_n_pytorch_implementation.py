@@ -1,290 +1,247 @@
+"""  # 模块说明: 简易的YOLOv8n风格 PyTorch 实现，教学用途，逐行注释版
+Lightweight PyTorch implementation of a YOLOv8n-like architecture (educational).  # 简要说明
+
+This module implements simplified, readable building blocks used in YOLO-style  # 描述模块包含的组件
+models so you can study and experiment with them. It's intended for learning  # 用途：学习与实验
+and demonstration rather than production deployment.  # 不是生产级实现
+
+Implemented components:  # 列出已实现的模块
+- Conv-BN-SiLU block (ConvBnAct)  # 卷积+BN+SiLU
+- Bottleneck residual block  # 瓶颈残差块
+- C2f module (channel split, repeated bottlenecks, concat, fuse)  # C2f 模块
+- SPPF module (fast spatial pyramid pooling)  # SPPF 模块
+- Simplified Backbone producing three feature-map scales  # 简化 backbone
+- Simplified Neck (top-down + bottom-up fusion using C2f)  # 简化 neck
+- Detect head (decoupled classification + distributional regression)  # 检测头
+- Decode utilities: softmax->expectation, build boxes, simple per-class NMS  # 解码工具
+
+Run the file as a script to instantiate the model and run a dummy forward.  # 运行示例
+
+Author: educational example  # 作者信息
 """
-Lightweight PyTorch implementation of a YOLOv8n-like architecture (educational).
 
-This module implements simplified, readable building blocks used in YOLO-style
-models so you can study and experiment with them. It's intended for learning
-and demonstration rather than production deployment.
+import math  # 导入数学库，用于 sqrt 等
+from typing import List, Tuple  # 类型注解用的 List/Tuple
 
-Implemented components:
-- Conv-BN-SiLU block (ConvBnAct)
-- Bottleneck residual block
-- C2f module (channel split, repeated bottlenecks, concat, fuse)
-- SPPF module (fast spatial pyramid pooling)
-- Simplified Backbone producing three feature-map scales
-- Simplified Neck (top-down + bottom-up fusion using C2f)
-- Detect head (decoupled classification + distributional regression)
-- Decode utilities: softmax->expectation, build boxes, simple per-class NMS
-
-Run the file as a script to instantiate the model and run a dummy forward.
-
-Author: educational example
-"""
-
-import math
-from typing import List, Tuple
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch  # PyTorch 主包
+import torch.nn as nn  # 神经网络模块简写
+import torch.nn.functional as F  # 函数式接口 (例如 interpolate, softmax)
 
 
 # --------------------------- Basic modules ---------------------------------
-class ConvBnAct(nn.Module):
-    """Conv -> BatchNorm -> SiLU (a.k.a. Swish)
+class ConvBnAct(nn.Module):  # Conv-BN-Act 基础块
+    """Conv -> BatchNorm -> SiLU (a.k.a. Swish)  # 模块说明
 
-    This convenience wrapper groups a convolution, batch normalization and
-    a SiLU activation into one reusable block. Using these small building
-    blocks keeps the higher-level module definitions compact.
+    封装了卷积、批归一化和 SiLU 激活，便于复用。  # 目的
     """
-    def __init__(self, c1, c2, k=3, s=1, p=None, bias=False):
-        super().__init__()
-        if p is None:
+    def __init__(self, c1, c2, k=3, s=1, p=None, bias=False):  # 构造函数
+        super().__init__()  # 调用父类构造器
+        if p is None:  # 如果未指定 padding，则使用 kernel//2 保持 'same' 行为
             p = k // 2
-        self.conv = nn.Conv2d(c1, c2, k, s, p, bias=bias)
-        self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU()
+        self.conv = nn.Conv2d(c1, c2, k, s, p, bias=bias)  # 2D 卷积
+        self.bn = nn.BatchNorm2d(c2)  # 批归一化
+        self.act = nn.SiLU()  # SiLU 激活
 
-    def forward(self, x):
-        # conv -> bn -> act
+    def forward(self, x):  # 前向函数
+        # 按顺序 conv -> bn -> act
         return self.act(self.bn(self.conv(x)))
 
 
-class Bottleneck(nn.Module):
-    """A lightweight bottleneck residual block.
+class Bottleneck(nn.Module):  # Bottleneck 残差块
+    """1x1 降维 -> 3x3 处理 -> 可选残差相加  # 说明
 
-    Pattern: 1x1 conv to reduce channels -> 3x3 conv to process -> optional
-    residual add if input and output channels match. This is commonly used
-    inside more complex modules (e.g. C2f) to add capacity with a small cost.
+    用于在保持较低计算的条件下增加网络深度与表现力。  # 目的
     """
-    def __init__(self, c1, c2, shortcut=True, expansion=0.5):
+    def __init__(self, c1, c2, shortcut=True, expansion=0.5):  # 构造
         super().__init__()
-        c_ = int(c2 * expansion)
-        self.conv1 = ConvBnAct(c1, c_, k=1)
-        self.conv2 = ConvBnAct(c_, c2, k=3)
-        self.use_add = shortcut and c1 == c2
+        c_ = int(c2 * expansion)  # 中间通道数 = c2 * expansion
+        self.conv1 = ConvBnAct(c1, c_, k=1)  # 1x1 conv 降维
+        self.conv2 = ConvBnAct(c_, c2, k=3)  # 3x3 conv
+        self.use_add = shortcut and c1 == c2  # 仅当通道匹配且允许 shortcut 时使用残差
 
-    def forward(self, x):
-        # apply the two conv layers
-        y = self.conv2(self.conv1(x))
-        # add residual only when channels match and shortcut requested
-        if self.use_add:
-            return x + y
-        return y
+    def forward(self, x):  # 前向
+        y = self.conv2(self.conv1(x))  # 先 conv1 再 conv2
+        if self.use_add:  # 如果允许残差且形状匹配
+            return x + y  # 残差相加
+        return y  # 否则直接返回
 
 
-class C2f(nn.Module):
-    """C2f module (channel-splitting + fused path).
+class C2f(nn.Module):  # C2f 模块
+    """通道拆分 + 右分支多次 Bottleneck 处理 + 拼接融合  # 说明
 
-    The input is first projected to `c2` channels, then split in half along the
-    channel dimension. The right half is processed by `n` Bottleneck blocks, and
-    all intermediate right-half outputs (including the initial right half) are
-    concatenated and fused together with the left half. This follows the C2f
-    design in YOLOv8 where multiple internal representations are combined.
+    先通过 1x1 投影到 c2 通道，然后把通道对半分为左/右。右半部分依次
+    通过 n 个 Bottleneck，并把每一步的输出保存以便 concat，最后与左半
+    一起通过 1x1 conv 融合回 c2 通道。
     """
     def __init__(self, c1, c2, n=1, expansion=0.5):
         super().__init__()
-        self.cv1 = ConvBnAct(c1, c2, k=1)
+        self.cv1 = ConvBnAct(c1, c2, k=1)  # 投影到 c2
         self.n = n
         self.c2 = c2
-        # we will split in half (floor)
         self.expand = expansion
-        m = c2 // 2
-        # create n bottlenecks acting on the right split
+        m = c2 // 2  # 右/左每份通道数（向下取整）
+        # 右分支的 n 个 Bottleneck
         self.blocks = nn.ModuleList([Bottleneck(m, m, shortcut=True, expansion=1.0) for _ in range(n)])
-        # final fuse conv
+        # 最后融合的 1x1 conv，输入通道 = p + (n+1)*m = (n+2)*m
         self.cv2 = ConvBnAct((n + 2) * m, c2, k=1)
 
     def forward(self, x):
-        x = self.cv1(x)  # -> [B, c2, H, W]
+        x = self.cv1(x)  # 先投影 -> [B, c2, H, W]
         c = x.shape[1]
         m = c // 2
-        # split channels into left (p) and right (q) parts
-        p = x[:, :m, :, :]
-        q = x[:, m:, :, :]
-        qs = [q]
-        # process the right part through each bottleneck, saving intermediate
-        # outputs so they can be concatenated (this enriches representation).
+        p = x[:, :m, :, :]  # 左半部分
+        q = x[:, m:, :, :]  # 右半部分
+        qs = [q]  # 保存初始右半
         for blk in self.blocks:
-            q = blk(q)
-            qs.append(q)
-        # concatenate all right-side outputs, then concat with left part
-        qcat = torch.cat(qs, dim=1)
-        y = torch.cat([p, qcat], dim=1)
-        # final 1x1 conv to fuse channels back to c2
-        return self.cv2(y)
+            q = blk(q)  # 右分支经过每个 Bottleneck
+            qs.append(q)  # 保存中间输出
+        qcat = torch.cat(qs, dim=1)  # 把所有右侧输出沿通道 concat
+        y = torch.cat([p, qcat], dim=1)  # 与左侧 concat
+        return self.cv2(y)  # 最后 1x1 融合回 c2
 
 
-class SPPF(nn.Module):
-    """SPPF (Spatial Pyramid Pooling - Fast).
+class SPPF(nn.Module):  # SPPF 模块
+    """快速空间金字塔池化（SPPF）  # 说明
 
-    This implementation reduces channels, applies a sequence of same-sized
-    max-pooling operations (each reusing the previous result), concatenates
-    them and fuses the result. It provides multiple receptive fields cheaply.
+    通过一系列相同 kernel 的 maxpool (stride=1) 获得不同感受野的特征并拼接，
+    然后通过 1x1 conv 融合。此处采用级联池化（pool(pool(x))）的实现。
     """
     def __init__(self, c1, c2, k=5):
         super().__init__()
-        c_ = c1 // 2
-        self.cv1 = ConvBnAct(c1, c_, k=1)
-        self.pool = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
-        self.cv2 = ConvBnAct(c_ * 4, c2, k=1)
+        c_ = c1 // 2  # 降通道
+        self.cv1 = ConvBnAct(c1, c_, k=1)  # 降维 1x1
+        self.pool = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)  # 池化层
+        self.cv2 = ConvBnAct(c_ * 4, c2, k=1)  # 融合 conv
 
     def forward(self, x):
-        x = self.cv1(x)
-        y1 = self.pool(x)
-        y2 = self.pool(y1)
-        y3 = self.pool(y2)
-        # concat original and pooled features along channel dim and fuse
-        y = torch.cat([x, y1, y2, y3], dim=1)
-        return self.cv2(y)
+        x = self.cv1(x)  # 降通道
+        y1 = self.pool(x)  # 第一次池化
+        y2 = self.pool(y1)  # 第二次（在 y1 上）
+        y3 = self.pool(y2)  # 第三次
+        y = torch.cat([x, y1, y2, y3], dim=1)  # 拼接
+        return self.cv2(y)  # 融合后返回
 
 
 # --------------------------- Backbone --------------------------------------
-class SimpleBackbone(nn.Module):
-    """Simplified backbone that produces three intermediate feature maps.
+class SimpleBackbone(nn.Module):  # 简化的骨干网络
+    """产生三个尺度特征的简化 backbone（教学用）  # 说明
 
-    The network is intentionally compact for clarity: a stem conv followed by
-    three stages that downsample the spatial resolution. Each stage includes
-    a C2f block to add capacity. The deepest stage receives SPPF to increase
-    receptive field before returning features.
+    由一个 stem 和 3 个下采样阶段组成，每个阶段包含 C2f，最深处加入 SPPF。
     """
     def __init__(self):
         super().__init__()
-        # stem
-        self.stem = ConvBnAct(3, 32, k=3, s=1)
-        # stage 1 -> stride=2 downsample
-        self.conv1 = ConvBnAct(32, 64, k=3, s=2)
-        self.c2f1 = C2f(64, 64, n=1)
-        # stage 2
-        self.conv2 = ConvBnAct(64, 128, k=3, s=2)
-        self.c2f2 = C2f(128, 128, n=2)
-        # stage 3
-        self.conv3 = ConvBnAct(128, 256, k=3, s=2)
-        self.c2f3 = C2f(256, 256, n=3)
-        # sppf on deepest
-        self.sppf = SPPF(256, 256)
+        self.stem = ConvBnAct(3, 32, k=3, s=1)  # 输入 3 -> 32
+        self.conv1 = ConvBnAct(32, 64, k=3, s=2)  # 下采样 1
+        self.c2f1 = C2f(64, 64, n=1)  # 第一层 C2f
+        self.conv2 = ConvBnAct(64, 128, k=3, s=2)  # 下采样 2
+        self.c2f2 = C2f(128, 128, n=2)  # 第二层 C2f
+        self.conv3 = ConvBnAct(128, 256, k=3, s=2)  # 下采样 3
+        self.c2f3 = C2f(256, 256, n=3)  # 第三层 C2f
+        self.sppf = SPPF(256, 256)  # SPPF 在最深层
 
     def forward(self, x):
-        # x: [B,3,640,640]
-        # basic stem and downsampling stages
-        x = self.stem(x)               # -> [B,32,H,W] where H,W are input size
-        x = self.conv1(x)              # downsample -> channels 64
-        # first intermediate feature (shallower)
-        c3 = self.c2f1(x)              # chosen as the first return feature
-        x = self.conv2(c3)             # downsample -> channels 128
-        c4 = self.c2f2(x)              # mid-level feature
-        x = self.conv3(c4)             # downsample -> channels 256
-        c5 = self.c2f3(x)              # deep feature
-        c5 = self.sppf(c5)             # SPPF enriches deep feature
-        # Return three scales. Note: exact strides depend on input size; here
-        # we document the intended design (e.g. stride 8/16/32) for clarity.
-        return c3, c4, c5
+        # x: [B,3,H,W]
+        x = self.stem(x)  # stem
+        x = self.conv1(x)  # downsample -> 64
+        c3 = self.c2f1(x)  # 第一个返回特征
+        x = self.conv2(c3)  # downsample -> 128
+        c4 = self.c2f2(x)  # 第二个返回特征
+        x = self.conv3(c4)  # downsample -> 256
+        c5 = self.c2f3(x)  # 第三个（深）特征
+        c5 = self.sppf(c5)  # 使用 SPPF
+        return c3, c4, c5  # 返回三个尺度
 
 
 # --------------------------- Neck ------------------------------------------
-class SimpleNeck(nn.Module):
-    """Simplified neck that fuses backbone features top-down and bottom-up.
+class SimpleNeck(nn.Module):  # 简化的 neck
+    """PAN 风格的 neck: top-down + bottom-up 融合  # 说明
 
-    This neck implements a small PAN-like structure: lateral projections,
-    upsampling + concat + fusion (top-down), followed by downsampling + concat
-    + fusion (bottom-up). It returns three fused feature maps used by the head.
+    使用 lateral projection、上采样拼接融合（C2f），再自底向上下采样融合。
     """
     def __init__(self):
         super().__init__()
-        # lateral projections
-        self.lateral5 = ConvBnAct(256, 128, k=1)
-        self.lateral4 = ConvBnAct(128, 128, k=1)
-        self.lateral3 = ConvBnAct(64, 64, k=1)
-        # fusion C2f modules
-        self.c2f4 = C2f(128 + 128, 128, n=1)  # after concat upsample(c5)+c4
-        self.c2f3 = C2f(64 + 64, 64, n=1)     # after concat upsample(t4)+c3
-        # bottom-up
-        self.down4 = ConvBnAct(64, 128, k=3, s=2)
-        self.c2f_p4 = C2f(128 + 128, 128, n=1)
-        self.down5 = ConvBnAct(128, 256, k=3, s=2)
-        self.c2f_p5 = C2f(256 + 256, 256, n=1)
+        self.lateral5 = ConvBnAct(256, 128, k=1)  # 将 c5 投影到 128
+        self.lateral4 = ConvBnAct(128, 128, k=1)  # 将 c4 投影到 128
+        self.lateral3 = ConvBnAct(64, 64, k=1)  # 将 c3 投影到 64
+        self.c2f4 = C2f(128 + 128, 128, n=1)  # 融合上采样(c5) 与 c4
+        self.c2f3 = C2f(64 + 64, 64, n=1)  # 融合上采样(t4) 与 c3
+        self.down4 = ConvBnAct(64, 128, k=3, s=2)  # 下采样 t3 -> 匹配 t4 大小
+        self.c2f_p4 = C2f(128 + 128, 128, n=1)  # 底部融合得到 p4
+        self.down5 = ConvBnAct(128, 256, k=3, s=2)  # 下采样 p4 -> 匹配 p5
+        self.c2f_p5 = C2f(256 + 256, 256, n=1)  # 底部融合得到 p5
 
     def forward(self, c3, c4, c5):
-        # top-down
-        p5 = self.lateral5(c5)  # -> [B,128,H,W]
-        u5 = F.interpolate(p5, scale_factor=2, mode='nearest')  # up to c4 size
-        p4 = self.lateral4(c4)
-        t4 = torch.cat([u5, p4], dim=1)
-        t4 = self.c2f4(t4)
+        p5 = self.lateral5(c5)  # 投影 c5 -> p5
+        u5 = F.interpolate(p5, scale_factor=2, mode='nearest')  # 上采样到 c4 大小
+        p4 = self.lateral4(c4)  # 投影 c4
+        t4 = torch.cat([u5, p4], dim=1)  # 拼接上采样结果与 c4
+        t4 = self.c2f4(t4)  # 融合
 
-        u4 = F.interpolate(t4, scale_factor=2, mode='nearest')
-        p3 = self.lateral3(c3)
-        t3 = torch.cat([u4, p3], dim=1)
-        t3 = self.c2f3(t3)
+        u4 = F.interpolate(t4, scale_factor=2, mode='nearest')  # 上采样到 c3 大小
+        p3 = self.lateral3(c3)  # 投影 c3
+        t3 = torch.cat([u4, p3], dim=1)  # 拼接
+        t3 = self.c2f3(t3)  # 融合
 
-        # bottom-up
-        d3 = self.down4(t3)
-        p4_b = torch.cat([d3, t4], dim=1)
-        p4 = self.c2f_p4(p4_b)
+        d3 = self.down4(t3)  # 从 t3 下采样回 t4 大小
+        p4_b = torch.cat([d3, t4], dim=1)  # 拼接 bottom-up 与 top-down 的 t4
+        p4 = self.c2f_p4(p4_b)  # 融合得到 p4
 
-        d4 = self.down5(p4)
-        p5_b = torch.cat([d4, p5], dim=1)
-        p5 = self.c2f_p5(p5_b)
+        d4 = self.down5(p4)  # 下采样 p4 -> p5 大小
+        p5_b = torch.cat([d4, p5], dim=1)  # 拼接
+        p5 = self.c2f_p5(p5_b)  # 融合得到 p5
 
-        # outputs (h3,h4,h5)
-        return t3, p4, p5
+        return t3, p4, p5  # 返回三个尺度特征
 
 
 # --------------------------- Detect Head ----------------------------------
-class DetectHead(nn.Module):
-    """Decoupled detection head.
+class DetectHead(nn.Module):  # 检测头（解耦 cls 与 reg）
+    """检测头：分类分支 + 分布式回归分支  # 说明
 
-    For each input feature map the head predicts a classification score per
-    class and a distributional regression for each of the 4 box sides. The
-    regression output predicts a discrete distribution (K bins) per side; the
-    final distance is computed as the expectation over that distribution.
+    分类输出: [B, num_classes, H, W]，回归输出: [B, 4*(K), H, W]，K=reg_max+1。
+    解码时把回归 logits 通过 softmax->期望转换为距离。
     """
     def __init__(self, in_channels: List[int], num_classes: int = 80, reg_max: int = 16):
         super().__init__()
         self.num_classes = num_classes
         self.reg_max = reg_max
         self.nl = len(in_channels)
-        # per-scale convs
-        self.cls_convs = nn.ModuleList()
-        self.reg_convs = nn.ModuleList()
+        self.cls_convs = nn.ModuleList()  # 每个尺度的分类子网络
+        self.reg_convs = nn.ModuleList()  # 每个尺度的回归子网络
         for c in in_channels:
-            # small decoupled heads: a conv to reduce and one to output
+            # 分类分支：一个 ConvBnAct + 1x1 输出 num_classes
             self.cls_convs.append(nn.Sequential(
                 ConvBnAct(c, c, k=3),
                 nn.Conv2d(c, num_classes, kernel_size=1)
             ))
+            # 回归分支：一个 ConvBnAct + 1x1 输出 4*(K)
             self.reg_convs.append(nn.Sequential(
                 ConvBnAct(c, c, k=3),
                 nn.Conv2d(c, 4 * (reg_max + 1), kernel_size=1)
             ))
 
     def forward(self, feats: List[torch.Tensor], strides: List[int], training=False):
-        # feats: list of [B, C_i, H_i, W_i]
-        cls_outputs = []
-        reg_outputs = []
+        cls_outputs = []  # 保存每尺度的分类 logits
+        reg_outputs = []  # 保存每尺度的回归 logits
         for i, x in enumerate(feats):
-            cls_out = self.cls_convs[i](x)
-            reg_out = self.reg_convs[i](x)
+            cls_out = self.cls_convs[i](x)  # 分类 logits
+            reg_out = self.reg_convs[i](x)  # 回归 logits
             cls_outputs.append(cls_out)
             reg_outputs.append(reg_out)
         if training:
-            return cls_outputs, reg_outputs
-        # inference: decode into boxes
-        dets = []  # list of (boxes, scores, labels)
+            return cls_outputs, reg_outputs  # 训练模式直接返回 logits
+        dets = []  # 推理时存放解码后的 (boxes, scores, labels)
         for i, (cls_out, reg_out, s) in enumerate(zip(cls_outputs, reg_outputs, strides)):
-            b, nc, h, w = cls_out.shape
-            # class probs (sigmoid)
-            probs = torch.sigmoid(cls_out)  # [B, num_classes, H, W]
-            # reshape reg to [B, 4, K, H, W]
-            K = self.reg_max + 1
-            reg_out = reg_out.view(b, 4, K, h, w)
-            # decode per-batch
+            b, nc, h, w = cls_out.shape  # batch, channels(num_classes), H, W
+            probs = torch.sigmoid(cls_out)  # 对分类 logits 做 sigmoid -> 概率
+            K = self.reg_max + 1  # 每边的离散 bin 数
+            reg_out = reg_out.view(b, 4, K, h, w)  # reshape 为 [B,4,K,H,W]
             for bi in range(b):
-                # flatten spatial
-                prob_map = probs[bi].permute(1, 2, 0).reshape(-1, self.num_classes)  # [H*W, C]
-                reg_map = reg_out[bi].permute(2, 3, 4, 0).reshape(-1, 4, K)  # [H*W, 4, K]
-                boxes, scores, labels = decode_per_feature_map(reg_map, prob_map, s)
+                # 将空间维度 flatten 为 N = H*W
+                prob_map = probs[bi].permute(1, 2, 0).reshape(-1, self.num_classes)  # [N, C]
+                reg_map = reg_out[bi].permute(2, 3, 4, 0).reshape(-1, 4, K)  # [N,4,K]
+                boxes, scores, labels = decode_per_feature_map(reg_map, prob_map, s)  # 解码
                 dets.append((boxes, scores, labels))
-        return dets
+        return dets  # 返回所有尺度/批次的检测结果列表
 
 
 # --------------------------- Utilities ------------------------------------
